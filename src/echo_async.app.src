@@ -1,4 +1,4 @@
-{application, jsk_async,
+{application, echo_async,
  [
   {description, "Creation of non-linked processes and following them through completion"},
   {vsn, "1.0.0"},
