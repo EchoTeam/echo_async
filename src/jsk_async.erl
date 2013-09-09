@@ -147,11 +147,10 @@ pmap(ConcurrencyLevel, Timeout, Fun, List, Default, NeedOrder, Processed)
     {A, B, C} = now(),
     Until = {A, B, C + (Timeout * 1000)},
     Tab = ets:new(pmap, [private]),
-    try pmap(0, ConcurrencyLevel, Until, Tab, [], [], Fun, List, Default, NeedOrder, Processed) of
-        V -> ets:delete(Tab), V
-    catch C:R ->
-        ets:delete(Tab),
-        erlang:raise(C, R, erlang:get_stacktrace())
+    try
+        pmap(0, ConcurrencyLevel, Until, Tab, [], [], Fun, List, Default, NeedOrder, Processed)
+    after
+        ets:delete(Tab)
     end;
 pmap(_ConcurrencyLevel,_Timeout,_Fun, [], _Default, _NeedOrder, _Processed) -> {[], []}.
 
@@ -166,8 +165,8 @@ pmap(0,_CLevel,_Until,_Tab,OK,FAIL,_Fun,[],_Default, NeedOrder, _Processed) ->
     {pmap_result(NeedOrder, OK), FAIL};
 pmap(InFlight, CLevel, Until, Tab, OK, FAIL, Fun, [H|List], Default, NeedOrder, Processed)
         when InFlight < CLevel ->
-    Ref = pmap_spawn(Tab, Processed, fun() -> Fun(H) end),
-    ets:insert_new(Tab, {Ref, H}),
+    {Ref, Pid} = pmap_spawn(Tab, Processed, fun() -> Fun(H) end),
+    ets:insert_new(Tab, {Ref, Pid, H}),
     pmap(InFlight + 1, CLevel, Until, Tab, OK, FAIL, Fun, List, Default, NeedOrder, Processed + 1);
 pmap(InFlight, CLevel, Until, Tab, OK, FAIL, Fun, List, Default, NeedOrder, Processed) ->
     TimeDiffMs = case timer:now_diff(Until, now()) of
@@ -181,29 +180,44 @@ pmap(InFlight, CLevel, Until, Tab, OK, FAIL, Fun, List, Default, NeedOrder, Proc
                     true = ets:member(Tab, Ref),
                     {[{Order, V}|OK], FAIL};
                 exception ->
-                    Item = ets:lookup_element(Tab, Ref, 2),
+                    Item = ets:lookup_element(Tab, Ref, 3),
                     {OK, [pmap_apply_default(Default, Item, V)|FAIL]}
             end,
             ets:delete(Tab, Ref),
             pmap(InFlight-1, CLevel, Until,
                 Tab, NewOK, NewFAIL, Fun, List, Default, NeedOrder, Processed)
     after TimeDiffMs ->
+        Items = ets:foldl(fun({Ref, Pid, Item}, ResultItems) ->
+            true = unlink(Pid),
+            true = exit(Pid, kill),
+            true = ets:delete(Tab, Ref),
+            [Item | ResultItems]
+        end, [], Tab),
+        ok = pmap_messages_receive(Tab),
         {pmap_result(NeedOrder, OK), lists:foldl(fun(Item, A) ->
             [pmap_apply_default(Default, Item, timeout) | A]
-        end, FAIL, [V || {_, V} <- ets:tab2list(Tab)] ++ List)}
+        end, FAIL, Items ++ List)}
     end.
 
 pmap_spawn(Key, Order, F) ->
     Self = self(),
     Ref = make_ref(),
-    spawn_opt(fun() ->
+    Pid = spawn_opt(fun() ->
         try F() of
             V -> Self ! {Key, Ref, Order, return, V}
         catch
             C:R -> Self ! {Key, Ref, Order, exception, {C,R,erlang:get_stacktrace()}}
         end
     end, [link]),
-    Ref.
+    {Ref, Pid}.
+
+pmap_messages_receive(Tab) ->
+    receive
+        {Tab, _Ref, _Order, _Return, _V} ->
+            pmap_messages_receive(Tab)
+    after 0 ->
+        ok
+    end.
 
 pmap_apply_default(Default, _Item, _) when is_tuple(Default) -> Default;
 pmap_apply_default(Default, Item, _) when is_function(Default, 1) ->
@@ -271,51 +285,119 @@ notify(_, _) -> ok.
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
 
-echo_async_test() ->
+run_test_() ->
 
     FCompareA = fun(Arg) -> a = Arg end,
     FTestA = fun(a) -> {ok} end,
 
-    % Testing :join
-    A = jsk_async:run(fun() -> test end),
-    test = jsk_async:join(A),
-    {jsk_async, noproc} = try jsk_async:join(A) catch error:E0 -> E0 end,
-    B = jsk_async:run(fun() -> throw (foo) end),
-    foo = try jsk_async:join(B) catch throw:T -> T end,
-    C = jsk_async:run(fun() -> FCompareA(b) end),
-    {badmatch,b} = try jsk_async:join(C) catch error:E1 -> E1 end,
-    D = jsk_async:run(fun() -> FTestA(b) end),
-    function_clause = try {jsk_async:join(D)} catch error:ED -> ED end,
-    E = jsk_async:run(fun() -> exit(normal) end),
-    normal = try jsk_async:join(E) catch exit:EE -> EE end,
-    F = jsk_async:run(fun() -> exit(some_status) end),
-    {exit, some_status} = try jsk_async:join(F) catch CF:EF -> {CF, EF} end,
+    [{"join; join:noproc", fun() ->
+        R = jsk_async:run(fun() -> test end),
+        ?assertEqual(test, jsk_async:join(R)),
+        ?assertEqual({jsk_async, noproc}, try jsk_async:join(R) catch error:E -> E end)
+    end},
+    {"join:throw", fun() ->
+        R = jsk_async:run(fun() -> throw (foo) end),
+        ?assertEqual(foo, try jsk_async:join(R) catch throw:T -> T end)
+    end},
+    {"join:error", fun() ->
+        R = jsk_async:run(fun() -> FCompareA(b) end),
+        ?assertEqual({badmatch, b}, try jsk_async:join(R) catch error:E -> E end)
+    end},
+    {"join:function_clause", fun() ->
+        R = jsk_async:run(fun() -> FTestA(b) end),
+        ?assertEqual(function_clause, try {jsk_async:join(R)} catch error:E -> E end)
+    end},
+    {"join:exit", fun() ->
+        R = jsk_async:run(fun() -> exit(normal) end),
+        ?assertEqual(normal, try jsk_async:join(R) catch exit:E -> E end)
+    end},
+    {"join:exit some_status", fun() ->
+        R = jsk_async:run(fun() -> exit(some_status) end),
+        ?assertEqual({exit, some_status}, try jsk_async:join(R) catch C:E -> {C, E} end)
+    end},
+    {"join:timeout; join:noproc", fun() ->
+        R = jsk_async:run(fun() -> timer:sleep(1000), tmo end),
+        ?assertEqual({error, {jsk_async, timeout}}, try jsk_async:join(R, 500) catch C1:E1 -> {C1, E1} end),
+        % Double-join is prohibited, simulating total ignorance.
+        ?assertEqual({error, {jsk_async, noproc}}, try jsk_async:join(R) catch C2:E2 -> {C2, E2} end)
+    end},
+    {"wait; wait:noproc", fun() ->
+        R = jsk_async:run(fun() -> test end),
+        ?assertEqual({ok, test}, jsk_async:wait(R)),
+        ?assertEqual({error, {jsk_async, noproc}}, jsk_async:wait(R))
+    end},
+    {"wait:throw", fun() ->
+        R = jsk_async:run(fun() -> throw (foo) end),
+        ?assertEqual({throw, foo}, jsk_async:wait(R))
+    end},
+    {"wait:error", fun() ->
+        R = jsk_async:run(fun() -> FCompareA(b) end),
+        ?assertEqual({error, {badmatch,b}}, jsk_async:wait(R))
+    end},
+    {"wait:function_clause", fun() ->
+        R = jsk_async:run(fun() -> FTestA(b) end),
+        ?assertEqual({error, function_clause}, jsk_async:wait(R))
+    end},
+    {"wait:exit", fun() ->
+        R = jsk_async:run(fun() -> exit(normal) end),
+        ?assertEqual({exit, normal}, jsk_async:wait(R))
+    end},
+    {"wait:exit some_status", fun() ->
+        R = jsk_async:run(fun() -> exit(some_status) end),
+        ?assertEqual({exit, some_status}, jsk_async:wait(R))
+    end}].
 
-    G = jsk_async:run(fun() -> timer:sleep(1000), tmo end),
-    {error, {jsk_async, timeout}} = try jsk_async:join(G, 500) catch CG:EG -> {CG, EG} end,
-    % Double-join is prohibited, simulating total ignorance.
-    {error, {jsk_async, noproc}} = try jsk_async:join(G) catch CG2:EG2 -> {CG2, EG2} end,
+pmap_test_() ->
+    Fun = fun
+        (0) ->
+            timer:sleep(200),
+            0;
+        (V) ->
+            V
+    end,
+    DefaultFun = fun(Item, Reason) ->
+        {Item, Reason}
+    end,
 
-    % Testing :wait
-    H = jsk_async:run(fun() -> test end),
-    {ok, test} = jsk_async:wait(H),
-    {error, {jsk_async, noproc}} = jsk_async:wait(H),
-    I = jsk_async:run(fun() -> throw (foo) end),
-    {throw, foo} = jsk_async:wait(I),
-    J = jsk_async:run(fun() -> FCompareA(b) end),
-    {error, {badmatch,b}} = jsk_async:wait(J),
-    K = jsk_async:run(fun() -> FTestA(b) end),
-    {error, function_clause} = jsk_async:wait(K),
-    L = jsk_async:run(fun() -> exit(normal) end),
-    {exit, normal} = jsk_async:wait(L),
-    M = jsk_async:run(fun() -> exit(some_status) end),
-    {exit, some_status} = jsk_async:wait(M),
+    [{"normal", fun() ->
+        Items = lists:seq(1, 1000),
+        ?assertEqual({Items, []},
+            jsk_async:pmap(10, 1000, Fun, Items, DefaultFun, true))
+    end},
+    {"timeout:queued", fun() ->
+        Items = [0, 1, 2],
+        ?assertEqual({[1, 2], [
+            {0, timeout}
+        ]}, jsk_async:pmap(10, 100, Fun, Items, DefaultFun, true))
+    end},
+    {"timeout:planned", fun() ->
+        Items = [0, 0],
+        ?assertEqual({[], [
+            {0, timeout},
+            {0, timeout}
+        ]}, jsk_async:pmap(1, 100, Fun, Items, DefaultFun, true))
+    end},
+    {"cleanup", fun() ->
+        Items = [0, 0],
+        messages_receive(),
+        ?assertEqual({[], [undefined, undefined]}, jsk_async:pmap(10, 100, Fun, Items, undefined, true)),
+        timer:sleep(200),
+        ?assertEqual(0, messages_receive())
+    end}].
 
-    % Testing :pmap
-    N = lists:seq(0, 1000),
-    {N, []} = jsk_async:pmap(10, 1000, fun(V) -> V end, N, undefined, true),
-    O = tl(N),
-    {O, [undefined]} = jsk_async:pmap(10, 1000, fun(0) -> timer:sleep(2000), 0; (V) -> V end, N, undefined, true),
-    ok.
+% test private functions
+
+messages_receive() ->
+    messages_receive(0).
+
+messages_receive(Count) ->
+    receive
+        Message ->
+            io:format("~p~n", [Message]),
+            messages_receive(Count + 1)
+    after 0 ->
+        Count
+    end.
+
 
 -endif.
