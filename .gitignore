@@ -1,3 +1,6 @@
 .eunit
 ebin
+erl_crash.dump
+*~
+*.swp
 

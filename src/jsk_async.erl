@@ -142,8 +142,9 @@ pmap(ConcurrencyLevel, Timeout, Fun, List, Default) ->
 pmap(ConcurrencyLevel, Timeout, Fun, List, Default, NeedOrder) ->
     pmap(ConcurrencyLevel, Timeout, Fun, List, Default, NeedOrder, 0).
 
+pmap(_ConcurrencyLevel,_Timeout,_Fun, [], _Default, _NeedOrder, _Processed) -> {[], []};
 pmap(ConcurrencyLevel, Timeout, Fun, List, Default, NeedOrder, Processed)
-        when ConcurrencyLevel > 0, Timeout > 0, is_list(List), List /= [] ->
+        when ConcurrencyLevel > 0, Timeout > 0, is_list(List) ->
     {A, B, C} = now(),
     Until = {A, B, C + (Timeout * 1000)},
     Tab = ets:new(pmap, [private]),
@@ -151,8 +152,7 @@ pmap(ConcurrencyLevel, Timeout, Fun, List, Default, NeedOrder, Processed)
         pmap(0, ConcurrencyLevel, Until, Tab, [], [], Fun, List, Default, NeedOrder, Processed)
     after
         ets:delete(Tab)
-    end;
-pmap(_ConcurrencyLevel,_Timeout,_Fun, [], _Default, _NeedOrder, _Processed) -> {[], []}.
+    end.
 
 pmap_result(NeedOrder, OK) ->
     {_, Res} = lists:unzip(case NeedOrder of
@@ -187,37 +187,34 @@ pmap(InFlight, CLevel, Until, Tab, OK, FAIL, Fun, List, Default, NeedOrder, Proc
             pmap(InFlight-1, CLevel, Until,
                 Tab, NewOK, NewFAIL, Fun, List, Default, NeedOrder, Processed)
     after TimeDiffMs ->
-        Items = ets:foldl(fun({Ref, Pid, Item}, ResultItems) ->
-            true = unlink(Pid),
-            true = exit(Pid, kill),
-            true = ets:delete(Tab, Ref),
+        ExpiredList = ets:foldl(fun({Ref, Pid, Item}, ResultItems) ->
+            Pid ! do_not_answer,
             [Item | ResultItems]
         end, [], Tab),
-        ok = pmap_messages_receive(Tab),
         {pmap_result(NeedOrder, OK), lists:foldl(fun(Item, A) ->
             [pmap_apply_default(Default, Item, timeout) | A]
-        end, FAIL, Items ++ List)}
+        end, FAIL, ExpiredList ++ List)}
     end.
 
 pmap_spawn(Key, Order, F) ->
     Self = self(),
     Ref = make_ref(),
     Pid = spawn_opt(fun() ->
-        try F() of
-            V -> Self ! {Key, Ref, Order, return, V}
+        {Type, Value} = try
+            V = F(),
+            {return, V}
         catch
-            C:R -> Self ! {Key, Ref, Order, exception, {C,R,erlang:get_stacktrace()}}
+            Class:Reason ->
+                {exception, {Class, Reason, erlang:get_stacktrace()}}
+        end,
+        receive
+            do_not_answer ->
+                nop
+        after 0 ->
+            Self ! {Key, Ref, Order, Type, Value}
         end
     end, [link]),
     {Ref, Pid}.
-
-pmap_messages_receive(Tab) ->
-    receive
-        {Tab, _Ref, _Order, _Return, _V} ->
-            pmap_messages_receive(Tab)
-    after 0 ->
-        ok
-    end.
 
 pmap_apply_default(Default, _Item, _) when is_tuple(Default) -> Default;
 pmap_apply_default(Default, Item, _) when is_function(Default, 1) ->
@@ -358,31 +355,50 @@ pmap_test_() ->
     DefaultFun = fun(Item, Reason) ->
         {Item, Reason}
     end,
-
     [{"normal", fun() ->
         Items = lists:seq(1, 1000),
         ?assertEqual({Items, []},
             jsk_async:pmap(10, 1000, Fun, Items, DefaultFun, true))
     end},
-    {"timeout:queued", fun() ->
+    {"timeout:working", fun() ->
         Items = [0, 1, 2],
         ?assertEqual({[1, 2], [
             {0, timeout}
         ]}, jsk_async:pmap(10, 100, Fun, Items, DefaultFun, true))
     end},
-    {"timeout:planned", fun() ->
+    {"timeout:qeued", fun() ->
         Items = [0, 0],
         ?assertEqual({[], [
             {0, timeout},
             {0, timeout}
         ]}, jsk_async:pmap(1, 100, Fun, Items, DefaultFun, true))
     end},
-    {"cleanup", fun() ->
-        Items = [0, 0],
+    {"cleanup:mailbox", fun() ->
+        Items = [0],
         messages_receive(),
-        ?assertEqual({[], [undefined, undefined]}, jsk_async:pmap(10, 100, Fun, Items, undefined, true)),
+        ?assertEqual({[], [
+            {0, timeout}
+        ]}, jsk_async:pmap(10, 100, Fun, Items, DefaultFun)),
         timer:sleep(200),
         ?assertEqual(0, messages_receive())
+    end},
+    {"cleanup:processes", fun() ->
+        Items = [0],
+        Tab = ets:new(test, [set, public]),
+        try
+            ?assertEqual(true, ets:insert_new(Tab, {1, undefined})),
+            ChangeFun = fun(0) ->
+                timer:sleep(100),
+                ets:insert(Tab, {1, changed})
+            end,
+            ?assertEqual({[], [
+                {0, timeout}
+            ]}, jsk_async:pmap(10, 100, ChangeFun, Items, DefaultFun)),
+            timer:sleep(200),
+            ?assertEqual([{1, changed}], ets:lookup(Tab, 1))
+        after
+            ets:delete(Tab)
+        end
     end}].
 
 % test private functions
@@ -393,7 +409,6 @@ messages_receive() ->
 messages_receive(Count) ->
     receive
         Message ->
-            io:format("~p~n", [Message]),
             messages_receive(Count + 1)
     after 0 ->
         Count
