@@ -187,7 +187,7 @@ pmap(InFlight, CLevel, Until, Tab, OK, FAIL, Fun, List, Default, NeedOrder, Proc
             pmap(InFlight-1, CLevel, Until,
                 Tab, NewOK, NewFAIL, Fun, List, Default, NeedOrder, Processed)
     after TimeDiffMs ->
-        ExpiredList = ets:foldl(fun({Ref, Pid, Item}, ResultItems) ->
+        ExpiredList = ets:foldl(fun({_Ref, Pid, Item}, ResultItems) ->
             Pid ! do_not_answer,
             [Item | ResultItems]
         end, [], Tab),
@@ -408,7 +408,7 @@ messages_receive() ->
 
 messages_receive(Count) ->
     receive
-        Message ->
+        _Message ->
             messages_receive(Count + 1)
     after 0 ->
         Count
