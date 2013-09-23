@@ -355,34 +355,41 @@ pmap_test_() ->
     DefaultFun = fun(Item, Reason) ->
         {Item, Reason}
     end,
-    [{"normal", fun() ->
+    % all results are in <Ok> list, <Failed> list is empty
+    [{"without errors", fun() ->
         Items = lists:seq(1, 1000),
         ?assertEqual({Items, []},
             jsk_async:pmap(10, 1000, Fun, Items, DefaultFun, true))
     end},
-    {"timeout:working", fun() ->
+    % timeout when process already started
+    {"timeout on working processes", fun() ->
         Items = [0, 1, 2],
         ?assertEqual({[1, 2], [
             {0, timeout}
         ]}, jsk_async:pmap(10, 100, Fun, Items, DefaultFun, true))
     end},
-    {"timeout:qeued", fun() ->
+    % timeout when one of processes is not started yet because ConcurrencyLevel = 1
+    {"timeout on queued processes", fun() ->
         Items = [0, 0],
         ?assertEqual({[], [
             {0, timeout},
             {0, timeout}
         ]}, jsk_async:pmap(1, 100, Fun, Items, DefaultFun, true))
     end},
-    {"cleanup:mailbox", fun() ->
+    % timeout when process already started.
+    % after process will finish asynchronously no messages in current mailbox will be received.
+    {"clean mailbox", fun() ->
         Items = [0],
-        messages_receive(),
+        messages_received(),
         ?assertEqual({[], [
             {0, timeout}
         ]}, jsk_async:pmap(10, 100, Fun, Items, DefaultFun)),
         timer:sleep(200),
-        ?assertEqual(0, messages_receive())
+        ?assertEqual(0, messages_received())
     end},
-    {"cleanup:processes", fun() ->
+    % timeout when process already started.
+    % process can finish asynchronously successfully after this.
+    {"processes completed after errors", fun() ->
         Items = [0],
         Tab = ets:new(test, [set, public]),
         try
@@ -403,13 +410,13 @@ pmap_test_() ->
 
 % test private functions
 
-messages_receive() ->
-    messages_receive(0).
+messages_received() ->
+    messages_received(0).
 
-messages_receive(Count) ->
+messages_received(Count) ->
     receive
         _Message ->
-            messages_receive(Count + 1)
+            messages_received(Count + 1)
     after 0 ->
         Count
     end.
