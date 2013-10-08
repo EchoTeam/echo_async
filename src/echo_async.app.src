@@ -1,7 +1,7 @@
 {application, echo_async,
  [
   {description, "Creation of non-linked processes and following them through completion"},
-  {vsn, "1.0.0"},
+  {vsn, "1.0.1"},
   {registered, []},
   {applications, [
                   kernel,
